@@ -235,8 +235,9 @@ func (p *Proxy) ServeHTTP() error {
 	// urls we want to protect with middlewares
 
 	var privateChain = []middleware{
+		redirectMiddleware,
 		BasicAuthMiddleware,
-		AuthMiddleware,
+		//AuthMiddleware,
 		PrivateMiddleware,
 		RequestIdMiddleware,
 		capitalizeResponseBodyMiddleware,
@@ -458,6 +459,28 @@ var regexResponseBodyMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+var redirectMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Create a new response writer that
+		//wraps the original response writer
+		// and overrides the Write method
+		fmt.Println("start redirectMiddleware")
+		redirectUrl := "https://www.border0.com"
+
+		// pick a random number between 1 and 10
+		rand.Seed(time.Now().UnixNano())
+		if rand.Intn(10) == 1 {
+			// redirect to a random page
+			http.Redirect(w, r, redirectUrl, http.StatusFound)
+			logError(r, http.StatusFound)
+			fmt.Println("redirecting to ", redirectUrl)
+			return
+		}
+		f(w, r)
+		fmt.Println("end redirectMiddleware")
+	}
+}
+
 var BasicAuthMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Create a new response writer that
@@ -467,8 +490,7 @@ var BasicAuthMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
 		username, password, ok := r.BasicAuth()
 
 		if !ok {
-			//w.WriteHeader(http.StatusUnauthorized)
-			//w.Write([]byte("Unauthorized"))
+
 			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
