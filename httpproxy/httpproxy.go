@@ -1,13 +1,18 @@
 package httpproxy
 
 import (
+	"bytes"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/atoonk/httpproxy/httpproxy/vhostmanager"
@@ -190,7 +195,7 @@ func (p *Proxy) AddHost(sni string, upstreams []string) error {
 
 	}
 
-	proxy.ModifyResponse = p.logResponse
+	proxy.ModifyResponse = p.setLogResponse
 
 	return p.vhostmanager.PutHost(sni, upstreams, nil, proxy)
 
@@ -202,10 +207,9 @@ func (p *Proxy) GetStatuscode() int {
 func (p *Proxy) GetSize() int64 {
 	return p.size
 }
-func (p *Proxy) logResponse(rsp *http.Response) error {
+func (p *Proxy) setLogResponse(rsp *http.Response) error {
 	p.statuscode = rsp.StatusCode
 	p.size = rsp.ContentLength
-
 	return nil
 }
 
@@ -231,10 +235,12 @@ func (p *Proxy) ServeHTTP() error {
 	// urls we want to protect with middlewares
 
 	var privateChain = []middleware{
-
+		BasicAuthMiddleware,
 		AuthMiddleware,
 		PrivateMiddleware,
 		RequestIdMiddleware,
+		capitalizeResponseBodyMiddleware,
+		regexResponseBodyMiddleware,
 	}
 
 	server := http.Server{
@@ -246,6 +252,7 @@ func (p *Proxy) ServeHTTP() error {
 			p.proxyHandler, privateChain...,
 		),
 	}
+	log.Println("Starting server on port 8080")
 	return server.ListenAndServe()
 
 }
@@ -269,8 +276,19 @@ func (p *Proxy) proxyHandler(rw http.ResponseWriter, req *http.Request) {
 
 	// Forward the request to the target server using the ReverseProxy
 	target.ReverseProxy.ServeHTTP(rw, req)
-	log.Printf("%s %s %s %s %d, %d", req.Method, req.URL.Path, req.RemoteAddr, req.UserAgent(), p.statuscode, p.size)
 
+	p.logResponse(req)
+	//log.Printf("%s %s %s %s %d, %d", req.Method, req.URL.Path, req.RemoteAddr, req.UserAgent(), p.statuscode, p.size)
+
+}
+
+func (p *Proxy) logResponse(req *http.Request) error {
+	log.Printf("%s %s %s %s %d %d", req.Method, req.URL.Path, req.RemoteAddr, req.UserAgent(), p.statuscode, p.size)
+	return nil
+}
+func logError(req *http.Request, statusCode int) error {
+	log.Printf("%s %s %s %s %d", req.Method, req.URL.Path, req.RemoteAddr, req.UserAgent(), statusCode)
+	return nil
 }
 
 // buildChain builds the middlware chain recursively, functions are first class
@@ -289,9 +307,29 @@ var AuthMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// ... pre handler functionality
 		fmt.Println("start auth")
-		f(w, r)
+
+		// We randomize access for now, so we need a random true or false
+		// in a real world scenario, you would check the request for a token
+		// or other authentication method
+
+		//This generates a random integer between 0 and 1, and then checks if the value is equal to 1.
+		// If it is, allowed will be set to true. Otherwise, allowed will be set to false.
+		rand.Seed(time.Now().UnixNano())
+		allowed := rand.Intn(2) == 1
+
+		if !allowed {
+			//w.WriteHeader(http.StatusUnauthorized)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			logError(r, http.StatusUnauthorized)
+			// as long as you don't call the next handler, the chain stops
+
+		} else {
+			// Call next handler in chain
+			f(w, r)
+
+			// ... post handler functionality
+		}
 		fmt.Println("end auth")
-		// ... post handler functionality
 	}
 }
 
@@ -320,5 +358,129 @@ var RequestIdMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
 		f(w, r)
 		fmt.Println("end RequestIdMiddleware")
 		// ... post handler functionality
+	}
+}
+
+// capitalizedResponseWriter is a wrapper around http.ResponseWriter that capitalizes the response body
+var capitalizeResponseBodyMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Create a new response writer that
+		//wraps the original response writer
+		// and overrides the Write method
+		fmt.Println("start capitalizeResponseBodyMiddleware")
+		recorder := httptest.NewRecorder()
+
+		f(recorder, r)
+		response := recorder.Result()
+
+		// Read the response body
+		body, err := ioutil.ReadAll(response.Body)
+		if err != nil {
+			// Return an error if unable to read the response body
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			logError(r, http.StatusInternalServerError)
+			return
+		}
+
+		// Capitalize the response body
+		modifiedBody := strings.ToUpper(string(body))
+
+		// Set the modified response body in the response
+		response.Body = ioutil.NopCloser(bytes.NewBufferString(modifiedBody))
+		// Write the modified response to the response writer
+		response.Write(w)
+
+		fmt.Println("end capitalizeResponseBodyMiddleware")
+	}
+}
+
+// regexResponseBodyMiddleware is a wrapper around http.ResponseWriter rewrites the response body
+var regexResponseBodyMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Create a new response writer that
+		//wraps the original response writer
+		// and overrides the Write method
+		fmt.Println("start regexResponseBodyMiddleware")
+		recorder := httptest.NewRecorder()
+
+		f(recorder, r)
+		response := recorder.Result()
+
+		// Read the response body
+		body, err := ioutil.ReadAll(response.Body)
+		if err != nil {
+			// Return an error if unable to read the response body
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			logError(r, http.StatusInternalServerError)
+			return
+		}
+
+		// check if content type is text/html
+		if response.Header.Get("Content-Type") == "text/html" {
+
+			// Apply regex on the response body
+			// In this examp,e, we are looking for the <HEAD> tag and adding a string to it using a regex
+			// (?is) - case insensitive, multiline
+
+			re, err := regexp.Compile(`(?is)<HEAD>(.*?)</HEAD>(?-s)`)
+			// check if the regex is valid
+			if re != nil {
+
+				// replacement string
+				replacementString := "This is a replacement string"
+
+				// Replace the regex match with the replacement string
+				// check if the regex is valid
+
+				modifiedBody := re.ReplaceAllString(string(body), "<HEAD>${1}\n"+replacementString+"\n</HEAD>")
+
+				// Set the modified response body in the response
+				response.Body = ioutil.NopCloser(bytes.NewBufferString(modifiedBody))
+				// Write the modified response to the response writer
+				response.Write(w)
+			} else {
+				// Return an error if unable to read the response body
+				logError(r, http.StatusInternalServerError)
+				log.Println("couldnt complie regex ", err)
+
+				// Make sure to write the original response body
+				response.Body = ioutil.NopCloser(bytes.NewBufferString(string(body)))
+				response.Write(w)
+			}
+		} else {
+			println("not text/html")
+			// Make sure to write the original response body
+			response.Body = ioutil.NopCloser(bytes.NewBufferString(string(body)))
+			response.Write(w)
+		}
+
+		fmt.Println("end regexResponseBodyMiddleware")
+	}
+}
+
+var BasicAuthMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Create a new response writer that
+		//wraps the original response writer
+		// and overrides the Write method
+		fmt.Println("start BasicAuthMiddleware")
+		username, password, ok := r.BasicAuth()
+
+		if !ok {
+			//w.WriteHeader(http.StatusUnauthorized)
+			//w.Write([]byte("Unauthorized"))
+			w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		if username != "admin" || password != "admin" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			logError(r, http.StatusUnauthorized)
+			return
+		}
+
+		f(w, r)
+		fmt.Println("end BasicAuthMiddleware")
 	}
 }
