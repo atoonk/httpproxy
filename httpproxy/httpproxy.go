@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -235,13 +236,17 @@ func (p *Proxy) ServeHTTP() error {
 	// urls we want to protect with middlewares
 
 	var privateChain = []middleware{
-		redirectMiddleware,
-		BasicAuthMiddleware,
+		AddRepsonseHeaderMiddleware,
+		AddUpstreamHeaderMiddleware,
+		//OddPortNumberstMiddleware, // That's just crazy buddy :)
+
+		//IpAllowListMiddleware,
+		//redirectMiddleware,
+		//BasicAuthMiddleware,
 		//AuthMiddleware,
-		PrivateMiddleware,
-		RequestIdMiddleware,
-		capitalizeResponseBodyMiddleware,
-		regexResponseBodyMiddleware,
+		//RequestIdMiddleware,
+		//capitalizeResponseBodyMiddleware,
+		//regexResponseBodyMiddleware,
 	}
 
 	server := http.Server{
@@ -334,18 +339,6 @@ var AuthMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// PrivateMiddleware - takes in a http.HandlerFunc, and returns a http.HandlerFunc
-var PrivateMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
-	// one time scope setup area for middleware
-	return func(w http.ResponseWriter, r *http.Request) {
-		// ... pre handler functionality
-		fmt.Println("start private")
-		f(w, r)
-		fmt.Println("end private")
-		// ... post handler functionality
-	}
-}
-
 // RequestIdMiddleware - takes in a http.HandlerFunc, and returns a http.HandlerFunc
 var RequestIdMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
 	// one time scope setup area for middleware
@@ -416,6 +409,8 @@ var regexResponseBodyMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
+		fmt.Println("response body: ", string(body))
+
 		// check if content type is text/html
 		if response.Header.Get("Content-Type") == "text/html" {
 
@@ -437,6 +432,7 @@ var regexResponseBodyMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
 
 				// Set the modified response body in the response
 				response.Body = ioutil.NopCloser(bytes.NewBufferString(modifiedBody))
+				print("modified body: ", modifiedBody)
 				// Write the modified response to the response writer
 				response.Write(w)
 			} else {
@@ -452,6 +448,8 @@ var regexResponseBodyMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
 			println("not text/html")
 			// Make sure to write the original response body
 			response.Body = ioutil.NopCloser(bytes.NewBufferString(string(body)))
+			// dump the repsonse
+
 			response.Write(w)
 		}
 
@@ -504,5 +502,179 @@ var BasicAuthMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
 
 		f(w, r)
 		fmt.Println("end BasicAuthMiddleware")
+	}
+}
+
+// IpAllowList - takes in a http.HandlerFunc, and returns a http.HandlerFunc
+var IpAllowListMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
+	// one time scope setup area for middleware
+	return func(w http.ResponseWriter, r *http.Request) {
+		// ... pre handler functionality
+		fmt.Println("start IpAllowListMiddleware")
+
+		// create aslice of 10 allowed ip addresses
+		allowedIPs := []string{
+			"10.1.1.1/32",
+			"2.3.3.3",
+			//"0.0.0.0/0",
+			"127.0.0.1",
+		}
+
+		// get the ip address of the client
+		clientIp, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			http.Error(w, "Unauthorized IP", http.StatusUnauthorized)
+			logError(r, http.StatusUnauthorized)
+			return
+		}
+		clientIP := net.ParseIP(clientIp)
+
+		// Now check if the users IP is in the list of allowed IPs
+		allowed := false
+
+		// check if the ip address is in the list of allowed ips
+		for _, allowedIP := range allowedIPs {
+			// check if the client IP falls in the range of the allowed IP
+
+			_, ipNet, err := net.ParseCIDR(allowedIP)
+
+			if err != nil {
+				// allowedIP is not a CIDR, so check if it is a single IP
+				if clientIP.Equal(net.ParseIP(allowedIP)) {
+					allowed = true
+					break
+				}
+
+			} else {
+				// allowedIP is a CIDR, so check if clientIP is in the subnet
+				if ipNet.Contains(clientIP) {
+					// clientIP is in the subnet, so return true
+					allowed = true
+					break
+				}
+			}
+		}
+
+		if !allowed {
+			//w.WriteHeader(http.StatusUnauthorized)
+			http.Error(w, "Unauthorized IP address", http.StatusUnauthorized)
+			logError(r, http.StatusUnauthorized)
+			// as long as you don't call the next handler, the chain stops
+
+		} else {
+			// Call next handler in chain
+			f(w, r)
+
+			// ... post handler functionality
+		}
+		fmt.Println("end IpAllowListMiddleware")
+	}
+}
+
+// IpAllowList - takes in a http.HandlerFunc, and returns a http.HandlerFunc
+var OddPortNumberstMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
+	// one time scope setup area for middleware
+	return func(w http.ResponseWriter, r *http.Request) {
+		// ... pre handler functionality
+		fmt.Println("start OddPortNumberstMiddleware")
+
+		// get the ip and port address of the client
+		_, port, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			http.Error(w, "Unauthorized IP/port", http.StatusUnauthorized)
+			log.Panicln("error when parsing client ip ", err)
+			logError(r, http.StatusUnauthorized)
+			return
+		}
+		// check if port is an odd number
+		log.Println("port is ", port)
+		portInt, err := strconv.Atoi(port)
+		if err != nil {
+			http.Error(w, "Unauthorized IP/Port", http.StatusUnauthorized)
+			log.Panicln("error when parsing client port ", err)
+			logError(r, http.StatusUnauthorized)
+			return
+		}
+
+		if portInt%2 == 0 {
+			http.Error(w, "Unauthorized: Sorry only odd portnumbers are allowed, try again oddball! Port was "+port, http.StatusUnauthorized)
+			logError(r, http.StatusUnauthorized)
+			return
+		}
+
+		// Call next handler in chain
+		f(w, r)
+
+		// ... post handler functionality
+
+		fmt.Println("end OddPortNumberstMiddleware")
+	}
+}
+
+// AddUpstreamHeader - takes in a http.HandlerFunc, and returns a http.HandlerFunc
+var AddUpstreamHeader = func(f http.HandlerFunc) http.HandlerFunc {
+	// one time scope setup area for middleware
+	return func(w http.ResponseWriter, r *http.Request) {
+		// ... pre handler functionality
+		fmt.Println("start AddUpstreamHeader")
+
+		// get the ip address of the client
+		clientIp, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			http.Error(w, "Unable to parse IP", http.StatusUnauthorized)
+			log.Println("Unable to parse IP" + err.Error())
+			logError(r, http.StatusUnauthorized)
+			return
+		}
+
+		// Now lets' add this to the upstream request header
+		r.Header.Add("X-Forwarded-For", clientIp)
+		r.Header.Add("X-Real-IP", clientIp)
+		r.Header.Add("X-Special-Header", "This is a special header")
+
+		// Call next handler in chain
+		f(w, r)
+
+		// ... post handler functionality
+		fmt.Println("end AddUpstreamHeader")
+	}
+}
+
+// AddRepsonseHeaderMiddleware - takes in a http.HandlerFunc, and returns a http.HandlerFunc
+var AddRepsonseHeaderMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
+	// one time scope setup area for middleware
+	return func(w http.ResponseWriter, r *http.Request) {
+		// ... pre handler functionality
+		fmt.Println("start AddRepsonseHeaderMiddleware")
+
+		// Weird, need to add these headers before the header is written
+		w.Header().Add("X-Response-Header", "This is a response header")
+
+		// let also set the Server identifier
+		w.Header().Set("Server", "Andree's Proxy Server")
+
+		// let's set the date to yesterday
+		// not useful but funny
+		//w.Header().Set("Date", time.Now().AddDate(0, 0, -1).Format(time.RFC1123))
+
+		f(w, r)
+
+		fmt.Println("end AddRepsonseHeaderMiddleware")
+	}
+}
+
+// AddUpstreamHeaderMiddleware - takes in a http.HandlerFunc, and returns a http.HandlerFunc
+var AddUpstreamHeaderMiddleware = func(f http.HandlerFunc) http.HandlerFunc {
+	// one time scope setup area for middleware
+	return func(w http.ResponseWriter, r *http.Request) {
+		// ... pre handler functionality
+		fmt.Println("start AddUpstreamHeaderMiddleware")
+
+		// Weird, need to add these headers before the header is written
+		r.Header.Set("who-is-the-best", "Andree is the best")
+
+		f(w, r)
+
+		fmt.Println("end AddUpstreamHeaderMiddleware")
 	}
 }
